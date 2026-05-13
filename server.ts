@@ -1,5 +1,7 @@
-import "dotenv/config";
+import dotenv from "dotenv";
+dotenv.config({ override: true });
 import express from "express";
+import rateLimit from "express-rate-limit";
 import { createServer as createViteServer } from "vite";
 import path from "path";
 import { GoogleGenAI } from "@google/genai";
@@ -9,8 +11,9 @@ let aiClient: GoogleGenAI | null = null;
 function getAI() {
   if (!aiClient) {
     const key = process.env.GEMINI_API_KEY;
+    console.log("DEBUG: GEMINI_API_KEY is", key);
     if (!key || key === "MY_GEMINI_API_KEY") {
-      throw new Error("GEMINI_API_KEY is not configured or is invalid. Please set your API key in the secrets panel.");
+      throw new Error(`GEMINI_API_KEY is not configured or is invalid (Current: ${key}). Please set your API key in the secrets panel.`);
     }
     aiClient = new GoogleGenAI({ apiKey: key });
   }
@@ -19,9 +22,19 @@ function getAI() {
 
 async function startServer() {
   const app = express();
+  app.set('trust proxy', 1);
   const PORT = 3000;
 
   app.use(express.json());
+
+  // --- Rate Limiting ---
+  const analyzeLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 minutes
+    max: 10, // Limit each IP to 10 requests per `window` (here, per 15 minutes)
+    message: { error: "Too many analysis requests from this IP, please try again after 15 minutes" },
+    standardHeaders: true, // Return rate limit info in the `RateLimit-*` headers
+    legacyHeaders: false, // Disable the `X-RateLimit-*` headers
+  });
 
   // --- API Routes ---
   
@@ -29,7 +42,7 @@ async function startServer() {
     res.json({ status: "ok" });
   });
 
-  app.post("/api/analyze", async (req, res) => {
+  app.post("/api/analyze", analyzeLimiter, async (req, res) => {
     try {
       const { repoUrl } = req.body;
       if (!repoUrl) {
@@ -44,32 +57,65 @@ async function startServer() {
       const owner = match[1];
       const repo = match[2].replace('.git', '');
 
-      // 2. Fetch repo tree from GitHub
-      // Note: we are limiting to fetching just the root contents or a default branch to avoid huge payloads
-      const treeResponse = await fetch(`https://api.github.com/repos/${owner}/${repo}/contents`);
-      if (!treeResponse.ok) {
-        return res.status(treeResponse.status).json({ error: "Failed to fetch repository. Ensure it is public." });
+      const githubHeaders: Record<string, string> = {
+        'User-Agent': 'SentinelAI-App'
+      };
+      if (process.env.GITHUB_TOKEN) {
+        githubHeaders['Authorization'] = `token ${process.env.GITHUB_TOKEN}`;
       }
-      
-      const contents = await treeResponse.json();
-      
-      // Filter for code files (shallow fetch for prototype)
+
+      const fetchFromGitHub = async (url: string) => {
+        let res = await fetch(url, { headers: githubHeaders });
+        if (res.status === 401 && githubHeaders['Authorization']) {
+            // Token might be invalid (e.g. wrongly populated). Try without it.
+            const { Authorization, ...headersWithoutAuth } = githubHeaders;
+            res = await fetch(url, { headers: headersWithoutAuth });
+        }
+        return res;
+      };
+
+      // 2. Fetch repo info to get default branch
+      const repoInfoRes = await fetchFromGitHub(`https://api.github.com/repos/${owner}/${repo}`);
+      if (!repoInfoRes.ok) {
+        const errText = await repoInfoRes.text();
+        console.error("GitHub API Error for Repo Info:", errText);
+        return res.status(repoInfoRes.status).json({ error: `Failed to fetch repository info from GitHub. Status: ${repoInfoRes.status}, Error: ${errText}` });
+      }
+      const repoInfo = await repoInfoRes.json();
+      const defaultBranch = repoInfo.default_branch || 'main';
+
+      // 3. Fetch repo tree recursively
+      const treeResponse = await fetchFromGitHub(`https://api.github.com/repos/${owner}/${repo}/git/trees/${defaultBranch}?recursive=1`);
+      if (!treeResponse.ok) {
+        const errText = await treeResponse.text();
+        console.error("GitHub API Error for Tree:", errText);
+        return res.status(treeResponse.status).json({ error: `Failed to fetch repository tree. Status: ${treeResponse.status}, Error: ${errText}` });
+      }
+      const treeData = await treeResponse.json();
+
+      // Filter for code files
       const allowedExtensions = ['.js', '.ts', '.jsx', '.tsx', '.py', '.go', '.java', '.cpp', '.c', '.rs', '.php', '.rb'];
-      const fileCandidates = contents.filter((item: any) => 
-        item.type === 'file' && allowedExtensions.some(ext => item.name.endsWith(ext))
+      const fileCandidates = (treeData.tree || []).filter((item: any) => 
+        item.type === 'blob' && 
+        allowedExtensions.some(ext => item.path.endsWith(ext)) &&
+        !item.path.includes('node_modules/') &&
+        !item.path.includes('dist/') &&
+        !item.path.includes('build/') &&
+        !item.path.includes('.next/') &&
+        !item.path.includes('vendor/')
       ).slice(0, 5); // Take max 5 files for speed/token limits
 
       if (fileCandidates.length === 0) {
-        return res.status(400).json({ error: "No recognizable code files found in the repository root." });
+        return res.status(400).json({ error: "No recognizable code files found in the repository." });
       }
 
-      // 3. Fetch file contents
+      // 4. Fetch file contents
       const fileContexts = [];
       for (const file of fileCandidates) {
-        const fileRes = await fetch(file.download_url);
+        const fileRes = await fetch(`https://raw.githubusercontent.com/${owner}/${repo}/${defaultBranch}/${file.path}`);
         if (fileRes.ok) {
           const content = await fileRes.text();
-          fileContexts.push({ name: file.name, content });
+          fileContexts.push({ name: file.path, content });
         }
       }
 
@@ -106,7 +152,7 @@ RESPOND STRICTLY IN THIS JSON FORMAT:
       "suggestedFix": "Code snippet showing the fix"
     }
   ]
-}`;
+}`; // CRITICAL: Ensure ALL JSON values are properly escaped. If you include regular expressions, code snippets, or strings with backslashes, you MUST double-escape them (e.g., use \\\\s instead of \\s) so the output is valid JSON.
 
       let ai;
       try {
@@ -115,20 +161,56 @@ RESPOND STRICTLY IN THIS JSON FORMAT:
         return res.status(401).json({ error: err.message });
       }
 
+      const responseSchema = {
+        type: "OBJECT",
+        properties: {
+          summary: {
+            type: "OBJECT",
+            properties: {
+              securityScore: { type: "INTEGER" },
+              qualityScore: { type: "INTEGER" },
+              maintainabilityScore: { type: "INTEGER" },
+              overview: { type: "STRING" }
+            },
+            required: ["securityScore", "qualityScore", "maintainabilityScore", "overview"]
+          },
+          issues: {
+            type: "ARRAY",
+            items: {
+              type: "OBJECT",
+              properties: {
+                id: { type: "STRING" },
+                file: { type: "STRING" },
+                type: { type: "STRING" },
+                severity: { type: "STRING" },
+                title: { type: "STRING" },
+                description: { type: "STRING" },
+                suggestedFix: { type: "STRING" }
+              },
+              required: ["id", "file", "type", "severity", "title", "description", "suggestedFix"]
+            }
+          }
+        },
+        required: ["summary", "issues"]
+      };
+
       const response = await ai.models.generateContent({
         model: "gemini-2.5-flash",
         contents: prompt,
         config: {
             responseMimeType: "application/json",
+            responseSchema: responseSchema,
         }
       });
 
-      const jsonString = response.text();
+      let jsonString = response.text || "{}";
       let analysisResult;
       try {
-        analysisResult = JSON.parse(jsonString!);
-      } catch(e) {
-        return res.status(500).json({ error: "Failed to parse AI response." });
+        analysisResult = JSON.parse(jsonString);
+      } catch(e: any) {
+        console.error("Parse Error:", e);
+        console.error("Raw AI response:", response.text);
+        return res.status(500).json({ error: `Failed to parse AI response. Error: ${e?.message}` });
       }
 
       res.json({
@@ -138,7 +220,11 @@ RESPOND STRICTLY IN THIS JSON FORMAT:
       });
 
     } catch (error: any) {
-      console.error(error);
+      const errStr = String(error);
+      if (errStr.includes("429") || errStr.includes("RESOURCE_EXHAUSTED") || errStr.toLowerCase().includes("quota exceeded")) {
+        return res.status(429).json({ error: "Gemini API free tier quota exceeded. Please try again later or provide a paid tiered API key." });
+      }
+      console.error("ANALYSIS ERROR:", error);
       const msg = error.message || "An unexpected error occurred during analysis.";
       res.status(500).json({ error: msg });
     }
